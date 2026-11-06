@@ -152,8 +152,10 @@ func (d *demux) Broadcast(resp clientv3.WatchResponse) error {
 	if err != nil {
 		return err
 	}
+	// Revision of the newest event batch broadcast before this response.
+	prevBatchRev := d.history.PeekLatest()
 	d.updateStoreLocked(resp)
-	d.broadcastLocked(resp)
+	d.broadcastLocked(resp, prevBatchRev)
 	return nil
 }
 
@@ -226,12 +228,12 @@ func (d *demux) updateStoreLocked(resp clientv3.WatchResponse) {
 	d.maxRev = events[len(events)-1].Kv.ModRevision
 }
 
-func (d *demux) broadcastLocked(resp clientv3.WatchResponse) {
+func (d *demux) broadcastLocked(resp clientv3.WatchResponse, prevBatchRev int64) {
 	switch {
 	case resp.IsProgressNotify():
 		d.broadcastProgressLocked(resp.Header.Revision)
 	case len(resp.Events) != 0:
-		d.broadcastEventsLocked(resp.Events)
+		d.broadcastEventsLocked(resp.Events, prevBatchRev)
 	default:
 	}
 }
@@ -252,12 +254,18 @@ func (d *demux) broadcastProgressLocked(progressRev int64) {
 	}
 }
 
-func (d *demux) broadcastEventsLocked(events []*clientv3.Event) {
-	firstRev := events[0].Kv.ModRevision
+// broadcastEventsLocked sends events to active watchers. prevBatchRev is the
+// revision of the newest event batch broadcast before events (0 if none).
+func (d *demux) broadcastEventsLocked(events []*clientv3.Event, prevBatchRev int64) {
 	lastRev := events[len(events)-1].Kv.ModRevision
 
 	for w, nextRev := range d.activeWatchers {
-		if nextRev != 0 && firstRev > nextRev {
+		// Revisions seen by the demux are not contiguous: writes outside the
+		// cache prefix advance the etcd revision without producing an event
+		// here, so the batch may start well after nextRev even though the
+		// watcher has received everything. It only fell behind if an earlier
+		// batch at or after nextRev was not delivered to it.
+		if nextRev != 0 && nextRev <= prevBatchRev {
 			d.laggingWatchers[w] = nextRev
 			delete(d.activeWatchers, w)
 			continue

@@ -489,6 +489,54 @@ func TestCacheWithPrefixWatch(t *testing.T) {
 	}
 }
 
+// TestCacheWithPrefixWatchAcrossRevisionGaps verifies that a watcher on a prefix
+// cache keeps receiving events directly when writes outside the prefix leave
+// gaps between the revisions the cache observes. Resync is effectively disabled,
+// so events that are only delivered by resync never arrive.
+func TestCacheWithPrefixWatchAcrossRevisionGaps(t *testing.T) {
+	integration.BeforeTest(t)
+	clus := integration.NewCluster(t, &integration.ClusterConfig{Size: 1})
+	t.Cleanup(func() { clus.Terminate(t) })
+	client := clus.Client(0)
+	ctx := t.Context()
+
+	c, err := cache.New(client, "/foo/", cache.WithResyncInterval(time.Hour))
+	if err != nil {
+		t.Fatalf("New(...): %v", err)
+	}
+	t.Cleanup(c.Close)
+	if err := c.WaitReady(ctx); err != nil {
+		t.Fatalf("cache not ready: %v", err)
+	}
+
+	prefixCh := c.Watch(ctx, "/foo/", clientv3.WithPrefix())
+	keyCh := c.Watch(ctx, "/foo/b")
+
+	for i := 0; i < 5; i++ {
+		if _, err := client.Put(ctx, "/bar/x", "v"); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+		resp, err := client.Put(ctx, "/foo/b", fmt.Sprintf("v%d", i))
+		if err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+		wantRev := resp.Header.Revision
+		for name, ch := range map[string]clientv3.WatchChan{"prefix": prefixCh, "key": keyCh} {
+			select {
+			case wresp, ok := <-ch:
+				if !ok || wresp.Canceled {
+					t.Fatalf("%s watch: closed or canceled: %+v", name, wresp)
+				}
+				if len(wresp.Events) != 1 || wresp.Events[0].Kv.ModRevision != wantRev {
+					t.Fatalf("%s watch: got %v, want one event at revision %d", name, wresp.Events, wantRev)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("%s watch: event at revision %d not delivered", name, wantRev)
+			}
+		}
+	}
+}
+
 func TestCacheServerRequestProgress(t *testing.T) {
 	if integration.ThroughProxy {
 		t.Skip("grpc proxy currently does not support requesting progress notifications")

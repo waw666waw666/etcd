@@ -21,6 +21,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/require"
 
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/mvccpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
@@ -336,6 +337,87 @@ func TestSlowWatcherResync(t *testing.T) {
 	}
 }
 
+func TestBroadcastRevisionGapKeepsWatcherActive(t *testing.T) {
+	// Revisions observed by a prefix cache are not contiguous: writes outside
+	// the prefix advance the revision without producing an event. A watcher that
+	// received every batch must keep getting events directly, not wait for resync.
+	t.Run("gaps between event batches", func(t *testing.T) {
+		d := newDemux(16, time.Hour)
+		d.Init(1)
+		w := newWatcher(8, nil)
+		d.Register(w, 0)
+
+		for _, revs := range [][]int64{{5}, {8}, {12, 12}, {13, 20}} {
+			require.NoError(t, d.Broadcast(respWithEventRevs(revs...)))
+			gotRevs, gotSizes := readBatches(t, w, 1)
+			require.Equal(t, []int64{revs[0]}, gotRevs)
+			require.Equal(t, []int{len(revs)}, gotSizes)
+			require.Contains(t, d.activeWatchers, w)
+			require.Empty(t, d.laggingWatchers)
+		}
+	})
+
+	t.Run("gap after progress notification", func(t *testing.T) {
+		d := newDemux(16, time.Hour)
+		d.Init(1)
+		w := newWatcher(8, nil)
+		d.Register(w, 0)
+
+		require.NoError(t, d.Broadcast(respWithEventRevs(5)))
+		readBatches(t, w, 1)
+		require.NoError(t, d.Broadcast(progressNotify(9)))
+		resp := readResponse(t, w.respCh)
+		require.True(t, resp.IsProgressNotify())
+
+		require.NoError(t, d.Broadcast(respWithEventRevs(15)))
+		gotRevs, _ := readBatches(t, w, 1)
+		require.Equal(t, []int64{15}, gotRevs)
+		require.Contains(t, d.activeWatchers, w)
+	})
+
+	t.Run("gap after resync", func(t *testing.T) {
+		d := newDemux(16, time.Hour)
+		d.Init(1)
+		require.NoError(t, d.Broadcast(respWithEventRevs(5)))
+		require.NoError(t, d.Broadcast(respWithEventRevs(7)))
+
+		w := newWatcher(8, nil)
+		d.Register(w, 5)
+		require.Contains(t, d.laggingWatchers, w)
+		d.resyncLaggingWatchers()
+		gotRevs, _ := readBatches(t, w, 2)
+		require.Equal(t, []int64{5, 7}, gotRevs)
+		require.Contains(t, d.activeWatchers, w)
+
+		require.NoError(t, d.Broadcast(respWithEventRevs(11)))
+		gotRevs, _ = readBatches(t, w, 1)
+		require.Equal(t, []int64{11}, gotRevs)
+		require.Contains(t, d.activeWatchers, w)
+	})
+
+	t.Run("watcher that overflowed stays lagging and resyncs in order", func(t *testing.T) {
+		d := newDemux(16, time.Hour)
+		d.Init(1)
+		w := newWatcher(1, nil)
+		d.Register(w, 0)
+
+		require.NoError(t, d.Broadcast(respWithEventRevs(5)))
+		require.NoError(t, d.Broadcast(respWithEventRevs(6))) // buffer full
+		require.Contains(t, d.laggingWatchers, w)
+		require.NoError(t, d.Broadcast(respWithEventRevs(10)))
+		require.Contains(t, d.laggingWatchers, w)
+
+		gotRevs, _ := readBatches(t, w, 1)
+		require.Equal(t, []int64{5}, gotRevs)
+		for len(gotRevs) < 3 {
+			d.resyncLaggingWatchers()
+			revs, _ := readBatches(t, w, 1)
+			gotRevs = append(gotRevs, revs...)
+		}
+		require.Equal(t, []int64{5, 6, 10}, gotRevs)
+	})
+}
+
 func TestWatcherCompactResponseHasHeader(t *testing.T) {
 	w := newWatcher(1, nil)
 
@@ -514,4 +596,8 @@ func readBatches(t *testing.T, w *watcher, n int) (revs []int64, sizes []int) {
 		}
 	}
 	return revs, sizes
+}
+
+func progressNotify(rev int64) clientv3.WatchResponse {
+	return clientv3.WatchResponse{Header: &etcdserverpb.ResponseHeader{Revision: rev}}
 }
